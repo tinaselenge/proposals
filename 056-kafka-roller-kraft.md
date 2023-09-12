@@ -1,5 +1,3 @@
-<!-- This template is provided as an example with sections you may wish to comment on with respect to your proposal. Add or remove sections as required to best articulate the proposal. -->
-
 # Kafka Roller KRaft Support
 
 This proposal describes the actions that the KafkaRoller should take when operating 
@@ -12,7 +10,6 @@ in either the current KafkaRoller or a future iteration of the KafkaRoller.
 This proposal assumes that liveness/readiness of nodes is as described in [proposal #46](https://github.com/strimzi/proposals/blob/main/046-kraft-liveness-readiness.md) 
 and [PR #8892](https://github.com/strimzi/strimzi-kafka-operator/pull/8892).
 
-There is a related proposal describing how to diff controller configuration currently being discussed: [PR #82](https://github.com/strimzi/proposals/pull/82)
 
 ## Current situation
 
@@ -24,6 +21,12 @@ Roll in order:
  - Unready brokers
  - Ready brokers
  - Current controller
+
+### Triggers
+The following triggers an attempt to roll a broker:
+- Pod is annotated for manual rolling update
+- Pod is unready
+- Broker's configuration has changed and cannot be updated dynamically
 
 ### Rollability checks
  - Attempts to connect an admin client to the broker and if it can't connect rolls the broker
@@ -62,6 +65,16 @@ Roll in order:
 If KafkaRoller fails to roll the controller/combined nodes, it still tries to roll the brokers before reporting an error.
 This is required because until [KIP-919](https://cwiki.apache.org/confluence/display/KAFKA/KIP-919%3A+Allow+AdminClient+to+Talk+Directly+with+the+KRaft+Controller+Quorum) 
 is implemented in order to check the quorum state when rolling controllers at least one broker needs to be running.
+
+### Triggers
+The following will trigger an attempt to roll a KRaft controller or combined node:
+- Pod is annotated for manual rolling update
+- Pod is unready
+- Controller's configuration has changed and cannot be updated dynamically.
+
+The triggers for broker remain the same as Zookeeper mode.
+
+**NOTE** There is a related proposal describing how to diff controller configuration currently being discussed: [PR #82](https://github.com/strimzi/proposals/pull/82)
 
 ### Rollability checks
 
