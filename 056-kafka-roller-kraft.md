@@ -2,10 +2,9 @@
 
 This proposal describes the actions that the KafkaRoller should take when operating 
 against a Strimzi cluster in KRaft mode.
-The proposal omits details about exactly how this should be implemented because 
-the logic of the KafkaRoller is currently being rewritten.
-This proposal only describes the expected behaviour so that it can be implemented 
-in either the current KafkaRoller or a future iteration of the KafkaRoller.
+The proposal describes the checks the KafkaRoller should take, how it should perform 
+those checks and in what order but does not discuss exactly how the KafkaRoller works.
+This proposal is expected to apply to both the current KafkaRoller and a future iteration of the KafkaRoller.
 
 This proposal assumes that liveness/readiness of nodes is as described in [proposal #46](https://github.com/strimzi/proposals/blob/main/046-kraft-liveness-readiness.md) 
 and [PR #8892](https://github.com/strimzi/strimzi-kafka-operator/pull/8892).
@@ -84,8 +83,6 @@ The following are some of the triggers that would roll a KRaft controller or com
 
 The triggers for broker remain the same as Zookeeper mode.
 
-**NOTE** There is a related proposal describing how to diff controller configuration currently being discussed: [PR #82](https://github.com/strimzi/proposals/pull/82)
-
 ### Rollability checks
 The checks made by the KafkaRoller in different modes is described below.
 
@@ -93,24 +90,22 @@ The checks made by the KafkaRoller in different modes is described below.
 The checks include a new check for controllers to verify that rolling the node does not affect the quorum health.
 The proposed check is:
 - Create admin client connection to the brokers and call `describeMetadataQuorum` API
-- If failed to connect to the brokers, return `UnforceableProblem` which will result in delay and retry for the pod until the maximum attempts is reached
-- From the quorum info returned from the admin API, fetch `lastCaughtUpTimestamp` for every controller node. `lastCaughtUpTimestamp` is the last millisecond timestamp at which a replica controller was known to be caught up with the quorum leader
+- If failed to connect to the brokers, return `UnforceableProblem` which will result in delay and retry for the pod until the maximum attempts is reached.
+- From the quorum info returned from the admin API, fetch `lastCaughtUpTimestamp` for every controller except the current controller we are considering to roll. `lastCaughtUpTimestamp` is the last millisecond timestamp at which a replica controller was known to be caught up with the quorum leader.
 - Check the quorum leader id using the quorum info and identify the `lastCaughtUpTimestamp` of the quorum leader
-- Retrieve the current value of Kafka configuration `controller.quorum.fetch.timeout.ms`
+- Retrieve value of the Kafka property `controller.quorum.fetch.timeout.ms` from the desired configurations specified in the Kafka CR. If this property does not exist in the desired configurations, then use the hard-coded default value for it which is `2000`. The reason for this is explained further in the **NOTE** below.
+- Mark a node as caught up if `leaderLastCaughtUpTimestamp - replicaLastCaughtUpTimestamp < controllerQuorumFetchTimeoutMs`.
+- Count each controller node that is caught up, including the leader (`numOfCaughtUpControllers`).
+- Can roll if: `numOfCaughtUpControllers > ceil((double) totalNumOfControllers / 2)`.
 
-        **NOTE** Once [PR #82](https://github.com/strimzi/proposals/pull/82) is implemented, we would be able to get the current value for this configuration. Until then we would have to use the default value. 
-- Mark a node as caught up if `leaderLastCaughtUpTimestamp - replicaLastCaughtUpTimestamp < controllerQuorumFetchTimeoutMs`
-- Count each controller node that is caught up, including the leader (`numOfCaughtUpControllers`)
-- Can roll if: `numOfCaughtUpControllers > ceil((double) totalNumOfControllers / 2)`
-
-In order to perform quorum check for controller, KafkaRoller creates admin client connection to the brokers. This is required until [KIP-919](https://cwiki.apache.org/confluence/display/KAFKA/KIP-919%3A+Allow+AdminClient+to+Talk+Directly+with+the+KRaft+Controller+Quorum) is implemented. If KafkaRoller cannot connect to any of the brokers after the maximum attempts to retry, the controllers will be marked as failed to reconcile because of not being able to determine the quorum health. KafkaRoller would then try to reconcile the brokers, which may help restoring admin client connections to them. In this scenario, the reconcilation will be completed with failure and reported to the operator. The controllers quorum check will be retried in the next round of reconcilation.
+> NOTE: Until [KIP-919](https://cwiki.apache.org/confluence/display/KAFKA/KIP-919%3A+Allow+AdminClient+to+Talk+Directly+with+the+KRaft+Controller+Quorum) is implemented, KafkaRoller cannot create an admin connection to the controller directly to describe its configuration or the quorum state. Therefore KafkaRoller checks the desired configurations to get the value of `controller.quorum.fetch.timeout.ms` and creates admin client connection to the brokers for the quorum check. If KafkaRoller cannot connect to any of the brokers after the maximum attempts to retry, the controllers will be marked as failed to reconcile because of not being able to determine the quorum health. KafkaRoller would then try to reconcile the brokers, which may help restoring admin client connections to them. In this scenario, the reconcilation will be completed with failure and reported to the operator. The controllers quorum check will be retried in the next round of reconcilation.
 
 
 #### Separate brokers and controllers
 For controller-only:
  1. Does not force roll a controller performing log recovery
  2. Force rolls a broker if the pod is in stuck state
- 3. Attemps to connect an admin client to any of the brokers, if cannot connect, skip checks in `4` and `5` 
+ 3. Attempts to connect an admin client to any of the brokers, if cannot connect, skip checks in `4` and `5` 
  4. Rolls a controller if the controller configuration has changed
  5. Does not roll a controller if doing so would take the number of caught-up controllers (inc leader) to less than half of the quorum
 
@@ -126,7 +121,7 @@ For broker-only:
 #### Combined mode
 1. Does not force roll a combined node performing log recovery
 2. Force rolls a combined node if the pod is in stuck state
-3. Attemps to connect an admin client to any of the brokers, if cannot connect, skip checks in `4`, `5` and `6`
+3. Attempts to connect an admin client to any of the brokers, if cannot connect, skip checks in `4`, `5` and `6`
 4. Rolls a combined node if the controller configuration has changed OR if the broker configuration has changed and cannot be updated dynamically
 6. Does not roll a ready combined node if doing so would take the number of caught-up controllers (inc leader) to less than half of the quorum
 7. Does not roll a ready combined node if doing so would take the in-sync replicas count below `min.insync.replicas`
@@ -137,12 +132,15 @@ Remains the same as Zookeeper mode.
 
 
 #### Configuration changes
-For all kinds of nodes:
-- Retrieves the current Kafka configurations of the node via Admin client and compares it with the desired configurations specified in the Kafka CR.
-- Performs dynamic configuration updates if possible, otherwise rolls node on configuration change
+As implemented in [PR #9125](https://github.com/strimzi/strimzi-kafka-operator/pull/9125) until [KIP 919](https://cwiki.apache.org/confluence/display/KAFKA/KIP-919%3A+Allow+AdminClient+to+Talk+Directly+with+the+KRaft+Controller+Quorum+and+add+Controller+Registration) is implemented:
+ - For broker only nodes, configuration changes are handled in the same way as brokers in the ZooKeeper case. If controller configurations changed, they will be ignored and brokers will not roll.
+ - For controller only nodes, a hash of the controller configs is calculated. A change to this hash causes a restart of the node.
+ - For combined nodes, both controller and broker configurations are checked and handled in the same was as brokers in the ZooKeeper case.
 
-**NOTE:** At the time of writing this proposal, it is not possible to connect to controller nodes via admin client to retrieve the current configuration or apply dynamic configuration updates. The related proposal in 
-[PR #82](https://github.com/strimzi/proposals/pull/82) describes a workaround for retrieving the current configuration of controller nodes so we can detect if there is any configuration change. However dynamic configuration update for them would not possible until [KIP 919](https://cwiki.apache.org/confluence/display/KAFKA/KIP-919%3A+Allow+AdminClient+to+Talk+Directly+with+the+KRaft+Controller+Quorum) is implemented. Therefore until then, the controllers will be rolled when there is a configuration change.
+Once KIP 919 is implemented, the configurations of controller-only nodes will be diffed to see what values changed.
+If the configurations that were updated are dynamic configurations, the KafkaRoller will call the Admin API to dynamically update 
+these values. This will be similar to how dynamic configuration updates are handled in ZooKeeper mode.
+
 ## Affected/not affected projects
 
 The only affected project is the Strimzi cluster operator.
