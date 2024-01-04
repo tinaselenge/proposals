@@ -2,13 +2,13 @@
 
 ## Current situation
 
-The Kafka Roller is a Cluster Operator component that's responsible for rolling Kafka pods when:
-- non-dynamic reconfigurations needs to be applied
-- update in Kafka CRD is detected
+The Kafka Roller is a Cluster Operator component that's responsible for the rolling restart/reconfiguration of Kafka pods when:
+- reconfigurations need to be applied
+- update in the Kafka CRD is detected
 - a certificate is renewed
 - pods have been manually annotated by the user for controlled restarts
-- pod is stuck and is out of date
-- Kafka broker is unresponsive to Kafka Admin connections
+- pod is "stuck" (see below) and is out of date (TODO: explain this)
+- the pod is running a combined or broker node and is unresponsive to Kafka Admin connections
 
 These are not the exhaustive list of possible triggers for rolling Kafka pods, but the main ones to highlight.
 
@@ -20,24 +20,23 @@ A pod is considered stuck if it is in one of following states:
 
 ### Known Issues
 
-The existing KafkaRoller has been suffering from the following shortcomings:
+The existing KafkaRoller suffers from the following general shortcomings:
 - While it is safe and simple to restart one broker at a time, it is slow in large clusters.
-- It doesn’t worry about partition preferred leadership
-- Hard to reason about when things go wrong. The code is complex to understand and it's not easy to determine why a pod was restarted from logs that tend to be noisy.
-- Potential race condition between Cruise Control rebalance and KafkaRoller that could cause partitions under minimum in sync replica. This issue is described in more detail in the `Future Improvements` section.
+- It doesn’t worry about partition preferred leadership, which can result in more leadership changes than strictly necessary
+- It is hard to reason about when things go wrong. The code is complex to understand and it's not easy to determine why a pod was restarted from logs that tend to be noisy.
+- Potential race condition between Cruise Control rebalance and KafkaRoller that could cause partitions to go under minimum in sync replicas. This issue is described in more detail in the `Future Improvements` section.
 - The current code for KafkaRoller does not easily allow growth and adding new functionality due to its complexity.
 
+For KRaft specifically, the current KafkaRoller also requires non-trivial fixes and changes:
+- Currently the KafkaRoller has to connect to brokers successfully in order to get KRaft quorum information and determine whether a controller node can be restarted. This is because it was not possible to directly talk to KRaft controllers at the time before [KIP 919](https://cwiki.apache.org/confluence/display/KAFKA/KIP-919%3A+Allow+AdminClient+to+Talk+Directly+with+the+KRaft+Controller+Quorum+and+add+Controller+Registration) was implemented.
 
-The following non-trivial fixes and changes are missing from the current KafkaRoller's KRaft implementation:
-- Currently KafkaRoller has to connect to brokers successfully in order to get KRaft quorum information and determine whether a controller node can be restarted. This is because it was not possible to directly talk to KRaft controllers at the time before [KIP 919](https://cwiki.apache.org/confluence/display/KAFKA/KIP-919%3A+Allow+AdminClient+to+Talk+Directly+with+the+KRaft+Controller+Quorum+and+add+Controller+Registration) was implemented.
+- The KafkaRoller takes a long time to reconcile combined nodes if they are all in `Pending` state. This is because the combined node does not become ready until the quorum is formed and KafkaRoller waits for a pod to become ready before it attempts to restart other nodes. In order for the quorum to form, at least the majority of controller nodes need to be running at the same time. This is not easy to solve in the current KafkaRoller without introducing some major changes because it processes each node individually and there is no mechanism to restart multiple nodes in parallel. More information can be found [here](https://github.com/strimzi/strimzi-kafka-operator/issues/9426).
 
-- KafkaRoller takes a long time to reconcile combined nodes if they are all in `Pending` state. This is because the combined node does not become ready until the quorum is formed and KafkaRoller waits for a pod to become ready before it attempts to restart other nodes. In order for the quorum to form, at least the majority of controller nodes need to be running at the same time. This is not easy to solve in the current KafkaRoller without introducing some major changes because it processes each node individually and there is no mechanism to restart multiple nodes in parallel. More information can be found [here](https://github.com/strimzi/strimzi-kafka-operator/issues/9426).
+- The quorum health check is based on the `controller.quorum.fetch.timeout.ms` configuration which it reads from the desired configurations passed from the `Reconciler`. However, `CAReconcilor` and manual rolling update pass a null value for desired configurations because in both cases, because the nodes don't need reconfigurations. This results in performing the quorum healthcheck based on the hard-coded default value of `controller.quorum.fetch.timeout.ms` rather than the accurate configuration value when doing manual rolling update and rolling nodes for certificate renewal.
 
-- The quorum health check is based on the `controller.quorum.fetch.timeout.ms` configuration which it reads from the desired configurations passed from the Reconciler. However, `CAReconcilor` and manual rolling update pass null value for desired configurations because in both cases, the nodes don't need reconfigurations. This results in performing the quorum healthcheck based on the hard-coded default value of `controller.quorum.fetch.timeout.ms` rather than the accurate configuration value when doing manual rolling update and rolling nodes for certificate renewal.
+- The current roller's quorum health will be broken once we have scaling supported via [KIP-853](https://cwiki.apache.org/confluence/display/KAFKA/KIP-853%3A+KRaft+Controller+Membership+Changes). The KafkaRoller relies on the response from the `describeQuorum` API to get the total number of configured controllers. During scale down, the nodes could return inconsistent number of controllers in their responses until all nodes are updated with the correct configuration. This could result in the quorum healthcheck not passing, and therefore the rolling not being able to restart nodes.
 
-- The current roller's quorum health will be broken once we have scaling supported via [KIP-853](https://cwiki.apache.org/confluence/display/KAFKA/KIP-853%3A+KRaft+Controller+Membership+Changes). KafkaRoller relies on the response from `describeQuorum` API to get the total number of configured controllers. During scale down, the nodes could return inconsistent number of controllers in their responses until all nodes are updated with the correct configuration. This could result in quorum healthcheck not passing therefore not able to restart nodes.
-
-- KafkaRoller cannot transition nodes from controller only role to combined role. This is because the KRaft controller identifies the role of the node by `NodeRef` object which contains the desired role for the node rather than the currently assigned role. The current roller would have to be updated with a new mechanism to get the currently assigned role. More information can be found here [here](https://github.com/strimzi/strimzi-kafka-operator/issues/9434).
+- The KafkaRoller cannot transition nodes from controller only role to combined role. This is because the KRaft controller identifies the role of the node by `NodeRef` object which contains the _desired role_ for the node rather than the _currently assigned role_. The current roller would have to be updated with a new mechanism to get the currently assigned role. More information can be found here [here](https://github.com/strimzi/strimzi-kafka-operator/issues/9434).
 
 
 ## Motivation
@@ -46,15 +45,21 @@ Strimzi users have been reporting some of the issues mentioned above and would b
 
 The current KafkaRoller has complex and nested conditions therefore makes it challenging for users to debug and understand actions taken on their brokers when things go wrong and configure it correctly for their use cases. A new KafkaRoller that is redesigned to be simpler would help users to easily understand the code and configure it to their needs.
 
-As you can see above, the current KafkaRoller still needs various changes and potentially more as we get more experience with KRaft and discover more issues. Adding these non trivial changes to a component that is very complex and hard to reason, is expensive and poses potential risks of introducing bugs because of tightly coupled logics andlack of testability.
+As you can see above, the current KafkaRoller still needs various changes and potentially more as we get more experience with KRaft and discover more issues. Adding these non-trivial changes to a component that is very complex and hard to reason, is expensive and poses potential risks of introducing bugs because of tightly coupled logic and a lack of testability.
 
 ## Proposal
 
-The objective of this proposal is to introduce a new KafkaRoller with simplified logic therefore more testable, and has structured design resembling a finite state machine. KafkaRoller desisions can become more accurate and better informed by observations coming from different sources (e.g. Kubernetes API, KafkaAgent, Kafka Admin API). These sources will be abstracted so that KafkaRoller is not dependent on their specifics as long as it's getting the information it needs. This will enable the KafkaRoller to run even if the underlying platform is different, for example, not Kubernetes. 
+The objective of this proposal is to introduce a new KafkaRoller with simplified logic and which is more testable. 
+It has a structured design resembling a finite state machine, driven from a loop following the `Observe -> Analyse -> Act` pattern.
+(It is not a true FSM since the roller it unopinionated about which state transitions are legal).
+The observations come from different sources (e.g. Kubernetes API, KafkaAgent, Kafka Admin API). 
+These sources are abstracted so that KafkaRoller is not dependent on their specifics as long as it's getting the information it needs. 
+This helps testability and would enable the KafkaRoller to be used on non-Kubernetes platforms if desired.
 
-Depending on the observed states, the roller will perform specific actions, causing each node's state to transition to another state based on the corresponding action. This iterative process continues until each node's state aligns with the desired state.
+Depending on the analysis of the observed states, the roller will perform specific actions, causing each node's state to transition to another state based on the corresponding action.
+This iterative process continues until each node's state aligns with the desired state.
 
-It will also introduce an algorithm that can restart brokers in parallel while applying safety conditions that can guarantee Kafka producer availability and causing minimal impact on controllers and overall stability of clusters.
+The algorithm can optionally restart brokers in parallel while applying safety conditions that can guarantee Kafka producer availability and causing minimal impact on controllers and overall stability of clusters.
 
 0. The following can be the configured for the new KafkaRoller:
 
@@ -81,7 +86,7 @@ It will also introduce an algorithm that can restart brokers in parallel while a
  - <i>nodeId</i>: Node ID.
  - <i>nodeRoles</i>: Process roles of this node (e.g. controller, broker). This will be set using the pod labels `strimzi.io/controller-role` and `strimzi.io/broker-role` because these are currently assigned roles of the node.
  - <i>state</i>: It contains the current state of the node based on information collected from the abstracted sources. The table below describes the possible states.
- - <i>reason</i>: It is updated based on the current predicate logic from the Reconciler. For example, an update in the Kafka CR is detected.
+ - <i>reason</i>: It is updated based on the current predicate logic from the Reconciler. For example, an update in the Kafka CR is detected. This is included primarily to provide detailed error reporting.
  - <i>numRestarts</i>: The value is incremented each time the node has been attempted to restart.
  - <i>numReconfigs</i>: The value is incremented each time the node has been attempted to reconfigure.
  - <i>lastTransitionTime</i>: System.currentTimeMillis of last observed state transition.
@@ -101,31 +106,31 @@ It will also introduce an algorithm that can restart brokers in parallel while a
 2. The existing predicate function will be called for each of the nodes and those for which the function returns a non-empty list of reasons will be restarted.
 
 2. Group the nodes into four categories:
-   - `RESTART_FIRST` - Nodes that have `NOT_READY` or `NOT_RUNNING` state in their contexts. The group will also include nodes that
-      we cannot connect to via Admin API.
+   - `RESTART_FIRST` - Nodes that have `NOT_READY` or `NOT_RUNNING` state in their contexts. 
+       The group will also include nodes that we cannot connect to via the `Admin` API.
    - `RESTART` - Nodes that have non-empty list of reasons from the predicate function and have not been restarted yet (ServerContext.numRestarts == 0).
    - `MAYBE_RECONFIGURE` - Nodes that have empty list of reasons and have not been reconfigured yet (ServerContext.numReconfigs == 0).
    - `NOP` - Nodes that have been restarted or reconfigured at least once (ServerContext.numRestarts > 0 || ServerContext.numReconfigs > 0 ) and have either
              `LEADING_ALL_PREFERRED` or `SERVING` state. Also nodes that have `RECOVERING` state.
 
+    The intent behind having a `RESTART_FIRST` category that's distinct from plain `RESTART` is to avoid botched restarts taking making brokers unhealty over successive reconciliations.
 
-3. Restart nodes in `RESTART_FIRST` category either one by one in the following order unless all nodes are combined
-and are in `NOT_RUNNING` state:
-   - Pure controller nodes
-   - Combined nodes.
-   - Broker only nodes
-
-   If all controllers are combined and are in `NOT_RUNNING` state, restart all nodes in parallel and wait for them to have `SERVING`. Explained more in detail below.
+3. Restart nodes in `RESTART_FIRST` category.
+   - If all controllers are combined and are in `NOT_RUNNING` state, restart all nodes in parallel and wait for them to have `SERVING`. Explained more in detail below.
+   - Otherwise restart them one-by-one in the following order:
+       - Pure controller nodes
+       - Combined nodes.
+       - Broker only nodes
 
    Wait until the restarted node to have `SERVING` and then `LEADING_ALL_PREFERRED` state within `postReconfigureTimeoutMs`.
 
-4. Further refine the nodes in `MAYBE_RECONFIGURE` category:
+4. Further refine the nodes in the `MAYBE_RECONFIGURE` category:
    - Describe Kafka configurations for each node via Admin API and compare them against the desired configurations. This is essentially the same mechanism we use today for the current KafkaRoller.
    - If a node has configuration changes and they can be dynamically updated, add the node into another group called `RECONFIGURE`.
    - If a node has configuration changes but they cannot be dynamically updated, add nodes into the `RESTART` group.
    - If a node has no configuration changes, put the node into the `NOP` group.
 
-5. Reconfigure each node in `RECONFIGURE` group:
+5. Reconfigure each node in the `RECONFIGURE` group:
    - If `numReconfigs` of a node is greater than the configured `maxReconfigAttempts`, add a restart reason to its context. Otherwise continue.
    - Send `incrementalAlterConfig` request with its config updates.
    - Transitions the node's state to `RECONFIGURED` and increment its `numReconfigs`.
@@ -133,7 +138,7 @@ and are in `NOT_RUNNING` state:
 
 6. If at this point, the `RESTART` group is empty, the reconciliation will be completed successfully.
 
-7. Otherwise, batch nodes in `RESTART` group and get the next batch to restart:
+7. Otherwise, batch nodes in the `RESTART` group and get the next batch to restart:
    - Further categorize nodes based on their roles so that the following restart order can be enforced:
        1. `NON_ACTIVE_PURE_CONTROLLER` - Pure controller that is not the active controller
        2. `ACTIVE_PURE_CONTROLLER` - Pure controller is the active controller (the quorum leader)
@@ -147,13 +152,22 @@ and are in `NOT_RUNNING` state:
        - batch the nodes that do not have any partitions in common therefore can be restarted together.
        - remove nodes that have an impact on the availability from the batches (more on this later).
        - return the largest batch.
+       
+    This algorithm has the following properties:
+    1. Controllers are always restarted one-by-one, minimising the risk of lose quorum.
+    2. The active controller is always restarted after the other controllers, minimising controllership changes
+    3. Brokers can be optionally restarted in batches (lowering the time require for a rolling restart)
+    4. The batches are constructed to preserve availability to acks=all producers.
 
 8. Restart the nodes in the returned batch in parallel:
-   - If `numRestarts` of a node is larger than `maxRestarts`, return `MaxRestartsExceededException` , which will fail the reconciliation.
+   - If `numRestarts` of a node is larger than `maxRestarts`, return `MaxRestartsExceededException`, which will fail the reconciliation.
    - Otherwise, restart each node and transition its state to `RESTARTED` and increment its `numRestarts`.
    - After restarting all the nodes in the batch, wait for their states to become `SERVING` and then `LEADING_ALL_PREFERRED` until the configured `postRestartTimeoutMs` is reached.
 
 9. If there are no exceptions thrown at this point, the reconciliation completes successfully.
+
+
+TODO: say something about that the exception message will look like when reconciliation fails, so support the claim that the new roller is more understandable to users.
 
 #### Restarting not running combined nodes
 
@@ -175,7 +189,7 @@ At this point, we would have already built a map of brokers and their replicatin
 
 ### Switching from the current KafkaRoller to the new KafkaRoller
 
-The new KafkaRoller will only work with KRaft clusters therefore when running in Zookeeper mode, the current KafkaRoller
+The new KafkaRoller will only work with KRaft clusters therefore when running in Zookeeper mode, the current KafkaRoller TODO
 
 The new KafkaRoller will be enabled by default for new KRaft clusters which means new KRaft clusters will always run with the new KafkaRoller.
 
