@@ -3,8 +3,8 @@
 ## Current situation
 
 The Kafka Roller is an internal Cluster Operator component that's responsible for coordinating the rolling restart or reconfiguration of Kafka pods when:
-- non-dynamic reconfigurations needs to be applied
-- update in Kafka CR is detected
+- reconfigurations need to be applied (dynamic or non-dynamic)
+- an update in Kafka CR is detected
 - a TLS certificate is renewed
 - pods have been [manually annotated](https://strimzi.io/docs/operators/latest/full/deploying#rolling_pods_manually_alternative_to_drain_cleaner) by the user for controlled restarts
 - pod has a pending update (e.g. not running with the desired version or configuration) but stuck in one of the following states: `CrashLoopBackOff`,`ImagePullBackOff`, `ContainerCreating`, `Pending` and `Unschedulable`.
@@ -136,14 +136,12 @@ Some states map to multiple possible actions, but only one of them is taken base
 This is the initial/default state before observation.
 
 `NOT_RUNNING` nodes will restart only if the pod has an old revision (is out of date).
-This is because, if the node is not running at all, then restarting it likely won't make any difference unless the node is out of date.
+This is in line with the existing KafkaRoller because if the node is not running at all, then restarting it likely won't make any difference unless the node is out of date.
 For example, if a pod is in pending state due to misconfigured affinity rule, there is no point restarting this pod again or restarting other pods, because that would leave them in pending state as well.
 If the user then fixes the misconfigured affinity rule, then we should detect that the pod has an old revision, therefore should restart it so that the pod is scheduled correctly and runs.
 
 `RECOVERING` nodes will be waited and observed only.
-A Kafka node can take a long time to become ready while performing log recovery and it's not easy to determine how long it might take.
-Therefore, it's important to avoid restarting the node during this process, as doing so would restart the entire log recovery, potentially causing the node to enter a loop of continuous restarts without becoming ready.
-Moreover, while a node is in recovery, no other node should be restarted, as this could impact cluster availability and affect the client.
+Like the existing KafkaRoller, we will avoid restarting a node during log recovery as doing so does not help the node recover more quickly.
 
 `NOT_READY` nodes will be restarted if they have a restart reason and have not been restarted yet.
 If it is not ready after being restarted already, we don't want to restart any other nodes to avoid taking down more nodes.
@@ -159,19 +157,14 @@ If all nodes reach the desired state, the reconciliation will succeed.
 
 ### State machine cycles
 
-if a node is not in the desired state the process will be repeated unless the maximum number of attempts is reached or an error encountered while processing the node in which case the reconciliation fails.
-The maximum number of attempts is hard-coded to 10 in the current roller.
-It will be the same for the new roller, however there will be 2 other hard-coded maximum values added:
-- Maximum number of restarts that can be done for each node in a single reconciliation.
-- Maximum number of reconfigurations that can be attempted on each node before restarting the node.
-This is because restarting a node 10 times in every reconciliation is not productive.
-Also, in the current roller, if we failed to reconfigure a node, we immediately restart it.
-Reconfiguration can fail sometimes due to transitive error so it would be useful to retry the reconfiguration a few times before we decide to restart a node.
+If a node is not in the desired state, just like the existing KafkaRoller, the process will be repeated unless the maximum number of attempts (hard-coded to 10) is reached or an error encountered while processing the node in which case the reconciliation fails.
 
-The maximum number of attempts is how many times the overall process is repeated per node because of not reaching the desired state and the number of restarts is how many times a node is actually restarted.
-If any node has reached the maximum number of attempts or restarts, the reconciliation will fail.
-If the maximum number of reconfiguration is reached, then the node will be marked to restart but will not fail the reconciliation.
-When a new KafkaRoller instance is initiated either because it's a new reconciliation or a different reconcile step, the tracked number of actions taken on nodes will be reset.
+There will be an additional hard-coded maximum value added for dynamic reconfiguration attempts. 
+In the existing KafkaRoller, if we failed to dynamically reconfigure a node, we immediately restart it.
+Dynamic reconfiguration can fail sometimes due to transitive error so it would be useful to retry the reconfiguration a few times before we decide to restart a node. 
+The maximum attempts for dynamic reconfiguration before restarting a node will be hard-coded to 3.
+
+When a new rolling update is initiated (i.e. when a new KafkaRoller instance is created either because it's a new reconciliation or a different reconcile step), the tracked number of actions taken on nodes will be reset.
 
 ### Batch rolling
 
@@ -209,7 +202,7 @@ Topic: my-topic-519825123-1548488859	TopicId: WGaLCgx4SZezNmNPoVlCog	PartitionCo
 	Topic: my-topic-519825123-1548488859	Partition: 8	Leader: 8	Replicas: 8,0,1	Isr: 8,0,1	Elr: 	LastKnownElr: 
 ```
 
-When the batch size set to 1 by default, it took roughly 9 minutes and 10 seconds to roll all the brokers.
+When the maximum batch size set to 1 by default, it took roughly 9 minutes and 10 seconds to roll all the brokers.
 Duration of the rolling:
 ```
 cluster-d8799950-b-28cfea0b-0                      1/1     Running   0          11m
@@ -223,7 +216,7 @@ cluster-d8799950-b-28cfea0b-7                      1/1     Running   0          
 cluster-d8799950-b-28cfea0b-8                      1/1     Running   0          114s
 ```
 
-When the batch size set to 3 (which is the biggest number of brokers that can rolled in parallel with the given assignments), it took roughly 1 minute 55 seconds to roll all the brokers.
+When the maximum batch size set to 3 (which is the biggest number of brokers that can rolled in parallel with the given partition assignments), it took roughly 1 minute 55 seconds to roll all the brokers.
 Logs from the cluster operator:
 ```
 2025-11-17 13:11:42 DEBUG RackRolling:938 - Reconciliation #24(watch) Kafka(namespace-0/cluster-d8799950): Restart batch {2,5,8}
@@ -243,7 +236,7 @@ cluster-d8799950-b-28cfea0b-7                      1/1     Running   0          
 cluster-d8799950-b-28cfea0b-8                      1/1     Running   0          2m3s
 ```
 
-The test was done in a fairly small cluster that doesn't have much load but the difference in the time that it took to roll all the brokers were significant.
+Although this test was done in a fairly small cluster that doesn't have much load, the difference in the time that it took to roll all the brokers was significant.
 
 ### Configurability
 
@@ -256,8 +249,7 @@ Otherwise, the operator will hard code them to the default values:
 | Configuration | Default value | Exposed to user | Description |
 |:--------------|:--------------|:----------------| :-----------|
 | maxAttempts | 10 | No | Maximum number of times a node can be attempted after not reaching the desired state.  This is checked against the node's `numAttempts`.                                                                                                                      |
-| operationTimeoutMs | 60 seconds | Yes | Maximum amount of time to wait for nodes to transition to `READY` state after an action. This is already exposed to the user via environment variable `STRIMZI_OPERATION_TIMEOUT_MS`. |
-| `maxRestartAttempts` | 3 | No | Maximum number of restart attempts per node before failing the reconciliation. This is checked against node's `numRestartAttempts`.                                                                                                               |
+| operationTimeoutMs | 60 seconds | Yes | Maximum amount of time to wait for nodes to transition to `READY` state after an action. This is already exposed to the user via environment variable `STRIMZI_OPERATION_TIMEOUT_MS`. |                                                                                                             |
 | `maxReconfigAttempts`| 3 | No | Maximum number of dynamic reconfiguration attempts per node before restarting the node. This is checked against node's `numReconfigAttempts`. |
 | `maxBrokerBatchSize` | 1 | Yes | Maximum number of broker nodes that can be restarted in parallel. It will be exposed to the user via the new environment variable `STRIMZI_MAX_RESTART_BATCH_SIZE`. |
 | `postRestartDelayMs` | 0 | Yes | Delay to apply between node(s) restarts to slow down the rolling update. It will be exposed to the user via the new environment variable `STRIMZI_POST_RESTART_DELAY_SECONDS`.|
@@ -286,7 +278,7 @@ The following table shows the expected graduation of the feature gate:
 
 We expect to remain in Alpha for 2 releases, then in Beta for at least 2 releases, if not more until we are happy that issues are ironed out and the roller is running stable.
 
-Reddit is one of the Strimzi vendors that offered to test the new roller while it's in Alpha and Beta phase.
+Reddit is one of the Strimzi vendors that offered to test the new roller, and particularly the roller when running in batch mode while it's in Alpha and Beta phase.
 
 ### Future improvement
 
