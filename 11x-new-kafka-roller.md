@@ -192,6 +192,59 @@ The new roller will check if there are multiple controller nodes not working aff
 Unlike the batch rolling of brokers, the user cannot disable the roller from batch rolling the controllers.
 This is because the batch rolling will only be used in the case where multiple controllers are unavailable, affecting the quorum.
 
+#### Batch rolling example
+
+Here is the result from the batch rolling test done in a local cluster with 9 brokers hosting a topic with 9 partitions:
+```
+% k exec cluster-d8799950-b-28cfea0b-3 -n namespace-0 sh -- ./bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe                                                   
+Topic: my-topic-519825123-1548488859	TopicId: WGaLCgx4SZezNmNPoVlCog	PartitionCount: 9	ReplicationFactor: 3	Configs: min.insync.replicas=2
+	Topic: my-topic-519825123-1548488859	Partition: 0	Leader: 0	Replicas: 0,1,2	Isr: 0,1,2	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 1	Leader: 1	Replicas: 1,2,3	Isr: 1,2,3	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 2	Leader: 2	Replicas: 2,3,4	Isr: 2,3,4	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 3	Leader: 3	Replicas: 3,4,5	Isr: 3,4,5	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 4	Leader: 4	Replicas: 4,5,6	Isr: 4,5,6	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 5	Leader: 5	Replicas: 5,6,7	Isr: 5,6,7	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 6	Leader: 6	Replicas: 6,7,8	Isr: 6,7,8	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 7	Leader: 7	Replicas: 7,8,0	Isr: 7,8,0	Elr: 	LastKnownElr: 
+	Topic: my-topic-519825123-1548488859	Partition: 8	Leader: 8	Replicas: 8,0,1	Isr: 8,0,1	Elr: 	LastKnownElr: 
+```
+
+When the batch size set to 1 by default, it took roughly 9 minutes and 10 seconds to roll all the brokers.
+Duration of the rolling:
+```
+cluster-d8799950-b-28cfea0b-0                      1/1     Running   0          11m
+cluster-d8799950-b-28cfea0b-1                      1/1     Running   0          10m
+cluster-d8799950-b-28cfea0b-2                      1/1     Running   0          10m
+cluster-d8799950-b-28cfea0b-3                      1/1     Running   0          7m36s
+cluster-d8799950-b-28cfea0b-4                      1/1     Running   0          5m8s
+cluster-d8799950-b-28cfea0b-5                      1/1     Running   0          4m14s
+cluster-d8799950-b-28cfea0b-6                      1/1     Running   0          3m36s
+cluster-d8799950-b-28cfea0b-7                      1/1     Running   0          2m45s
+cluster-d8799950-b-28cfea0b-8                      1/1     Running   0          114s
+```
+
+When the batch size set to 3 (which is the biggest number of brokers that can rolled in parallel with the given assignments), it took roughly 1 minute 55 seconds to roll all the brokers.
+Logs from the cluster operator:
+```
+2025-11-17 13:11:42 DEBUG RackRolling:938 - Reconciliation #24(watch) Kafka(namespace-0/cluster-d8799950): Restart batch {2,5,8}
+2025-11-17 13:12:29 DEBUG RackRolling:938 - Reconciliation #57(timer) Kafka(namespace-0/cluster-d8799950): Restart batch {1,4,7}
+2025-11-17 13:13:29 DEBUG RackRolling:938 - Reconciliation #89(timer) Kafka(namespace-0/cluster-d8799950): Restart batch {0,3,6}
+```
+Duration of the rolling:
+```
+cluster-d8799950-b-28cfea0b-0                      0/1     Running   0          17s
+cluster-d8799950-b-28cfea0b-1                      1/1     Running   0          72s
+cluster-d8799950-b-28cfea0b-2                      1/1     Running   0          114s
+cluster-d8799950-b-28cfea0b-3                      0/1     Running   0          13s
+cluster-d8799950-b-28cfea0b-4                      1/1     Running   0          76s
+cluster-d8799950-b-28cfea0b-5                      1/1     Running   0          119s
+cluster-d8799950-b-28cfea0b-6                      0/1     Running   0          8s
+cluster-d8799950-b-28cfea0b-7                      1/1     Running   0          67s
+cluster-d8799950-b-28cfea0b-8                      1/1     Running   0          2m3s
+```
+
+The test was done in a fairly small cluster that doesn't have much load but the difference in the time that it took to roll all the brokers were significant.
+
 ### Configurability
 
 The following are the configuration options for the new roller.
